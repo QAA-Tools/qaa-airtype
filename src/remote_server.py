@@ -243,12 +243,6 @@ def get_all_ips():
     if not ips:
         ips.append('127.0.0.1')
 
-    # 将主要 IP 放在第一位
-    main_ip = get_host_ip()
-    if main_ip in ips:
-        ips.remove(main_ip)
-    ips.insert(0, main_ip)
-
     # IP 分类排序
     # 优先级：192.168.x.x > 10.x.x.x > 其他 > 虚拟网卡
     priority_192 = []  # 192.168.x.x (家庭/办公网络)
@@ -281,6 +275,19 @@ def get_all_ips():
 
     # 重新组合：优先级从高到低
     ips = priority_192 + priority_10 + other_ips + virtual_ips
+
+    # 将主要 IP 移到对应分类的第一位（保持分类顺序）
+    main_ip = get_host_ip()
+    if main_ip in ips:
+        ips.remove(main_ip)
+        # 根据主要 IP 的类型，插入到对应分类的开头
+        if main_ip.startswith('192.168.'):
+            insert_pos = 0
+        elif main_ip.startswith('10.'):
+            insert_pos = len(priority_192)
+        else:
+            insert_pos = len(priority_192) + len(priority_10)
+        ips.insert(insert_pos, main_ip)
 
     # 在最前面添加 0.0.0.0（监听所有网卡）
     ips.insert(0, '0.0.0.0 (所有网卡)')
