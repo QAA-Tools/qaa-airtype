@@ -372,10 +372,8 @@ class ServerApp:
 
     def toggle_server(self):
         if self.is_running:
-            # 停止服务
-            result = messagebox.askyesno("停止服务", "确定要停止服务吗？\n停止后需要重启程序才能再次启动。")
-            if result:
-                self.root.quit()
+            # 停止服务并退出
+            self.root.quit()
             return
 
         port_str = self.port_var.get()
