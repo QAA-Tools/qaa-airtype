@@ -248,25 +248,38 @@ def get_all_ips():
         ips.remove(main_ip)
     ips.insert(0, main_ip)
 
-    # 将虚拟网卡 IP 移到后面（10.x.x.x, 172.16-31.x.x）
-    virtual_ips = []
-    real_ips = []
+    # IP 分类排序
+    # 优先级：192.168.x.x > 10.x.x.x > 其他 > 虚拟网卡
+    priority_192 = []  # 192.168.x.x (家庭/办公网络)
+    priority_10 = []   # 10.x.x.x (企业网络)
+    other_ips = []     # 其他真实 IP
+    virtual_ips = []   # 虚拟网卡 IP
+
     for ip in ips:
-        if ip.startswith('10.') or ip.startswith('172.'):
-            # 检查是否是 172.16-31 段
-            if ip.startswith('172.'):
-                parts = ip.split('.')
-                if len(parts) >= 2 and 16 <= int(parts[1]) <= 31:
+        if ip.startswith('192.168.'):
+            priority_192.append(ip)
+        elif ip.startswith('10.'):
+            priority_10.append(ip)
+        elif ip.startswith('172.'):
+            # 检查是否是虚拟网卡
+            parts = ip.split('.')
+            if len(parts) >= 2:
+                second = int(parts[1])
+                # Docker: 172.17.x.x, 172.18.x.x
+                # Windows 虚拟网卡: 172.16.x.x
+                # 私有网络范围: 172.16-31.x.x
+                if 16 <= second <= 31:
                     virtual_ips.append(ip)
                 else:
-                    real_ips.append(ip)
-            else:
-                virtual_ips.append(ip)
+                    other_ips.append(ip)
+        elif ip.startswith('198.18.'):
+            # Clash 等代理工具虚拟网卡
+            virtual_ips.append(ip)
         else:
-            real_ips.append(ip)
+            other_ips.append(ip)
 
-    # 重新组合：真实 IP 在前，虚拟 IP 在后
-    ips = real_ips + virtual_ips
+    # 重新组合：优先级从高到低
+    ips = priority_192 + priority_10 + other_ips + virtual_ips
 
     # 在最前面添加 0.0.0.0（监听所有网卡）
     ips.insert(0, '0.0.0.0 (所有网卡)')
