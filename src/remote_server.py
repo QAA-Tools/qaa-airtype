@@ -317,13 +317,17 @@ class ServerApp:
 
     def toggle_server(self):
         if self.is_running:
+            # 停止服务
+            result = messagebox.askyesno("停止服务", "确定要停止服务吗？\n停止后需要重启程序才能再次启动。")
+            if result:
+                self.root.quit()
             return
 
         port_str = self.port_var.get()
         if not port_str.isdigit():
             messagebox.showerror("错误", "端口必须是数字")
             return
-        
+
         port = int(port_str)
         host_ip = self.ip_var.get()
         url = f"http://{host_ip}:{port}"
@@ -333,7 +337,7 @@ class ServerApp:
         t.start()
 
         self.is_running = True
-        self.btn_start.config(text="服务运行中...", state='disabled', bg="#34c759")
+        self.btn_start.config(text="停止服务", state='normal', bg="#ff3b30")
 
         # 生成并显示二维码
         try:
