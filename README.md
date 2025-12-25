@@ -15,7 +15,7 @@
 
 ## 📖 项目简介
 
-QAA AirType 是一个轻量级的局域网输入板，让你可以通过手机端的输入法（如豆包语音输入）来实现电脑端的文字输入（与Agent对话）。
+QAA AirType 是一个轻量级的远程输入工具，让你可以通过手机端的输入法（如豆包语音输入）来实现电脑端的文字输入。支持局域网直连和 Cloudflare Workers 跨网络两种模式。
 
 ### 为什么开发这个项目？
 
@@ -33,24 +33,23 @@ QAA AirType 是一个轻量级的局域网输入板，让你可以通过手机�
 
 - 📱 **扫码即用**：启动程序后扫描二维码即可连接
 - 📝 **历史记录**：保存最近10条输入记录，支持快速重发
-- 🌐 **局域网连接**：无需互联网，局域网内即可使用
-- ☁️ **跨网络支持**：通过 Cloudflare Workers 突破局域网限制
+- 🌐 **局域网模式**：无需互联网，同一 WiFi 下即可使用
+- ☁️ **Cloudflare 模式**：自建免费 Workers 服务，突破局域网限制，手机流量也能用
 - 🔽 **系统托盘**：最小化到托盘，不占用任务栏
 
 📖 **详细文档**：[https://qaa-tools.github.io/qaa-airtype/](https://qaa-tools.github.io/qaa-airtype/)
 
 ## 🚀 快速开始
 
-### 普通用户
+### 方式一：下载可执行文件
 
-1. 下载 `QAA-AirType.exe`
-2. 双击运行，点击"启动服务并生成二维码"
-3. 手机扫描二维码（确保同一 WiFi）
-4. 在手机网页使用语音输入，点击发送
+1. 从 [Releases](https://github.com/QAA-Tools/qaa-airtype/releases) 下载 `QAA-AirType.exe`
+2. 双击运行，选择连接模式（局域网 IP 或 Cloudflare）
+3. 点击"启动服务"
+4. 手机扫描二维码或访问显示的地址
+5. 在手机网页使用语音输入，点击发送，文字自动粘贴到电脑
 
-### 开发者
-
-#### 运行源码
+### 方式二：从源码运行
 
 ```bash
 git clone https://github.com/QAA-Tools/qaa-airtype.git
@@ -62,31 +61,6 @@ pip install flask pyautogui pyperclip qrcode pillow pystray
 # 运行程序
 python src/remote_server.py
 ```
-
-#### 项目结构
-
-```
-qaa-airtype/
-├── src/
-│   ├── remote_server.py     # 主程序
-│   └── generate_icon.py     # 图标生成
-├── build.ps1                # 构建脚本
-├── pyproject.toml          # 项目配置
-├── LICENSE                 # MIT 协议
-└── README.md               # 项目说明
-```
-
-#### 编译可执行文件
-
-```bash
-powershell -ExecutionPolicy Bypass -File build.ps1
-```
-
-编译完成后，可执行文件位于 `dist/QAA-AirType.exe`
-
-#### 技术栈
-
-Flask · Tkinter · PyAutoGUI · Pyperclip · QRCode · Pillow · Pystray
 
 ## 🙏 致谢
 
