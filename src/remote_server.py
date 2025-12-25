@@ -17,6 +17,47 @@ import os
 import sys
 import tempfile
 import ctypes
+import asyncio
+import hashlib
+import json
+
+# CF 模式依赖（可选）
+try:
+    import websockets
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    CF_AVAILABLE = True
+except ImportError:
+    CF_AVAILABLE = False
+
+# --- 配置文件 ---
+def get_config_path():
+    """获取配置文件路径"""
+    if IS_WINDOWS:
+        config_dir = os.path.join(os.environ.get('APPDATA', ''), 'QAA-AirType')
+    else:
+        config_dir = os.path.join(os.path.expanduser('~'), '.config', 'qaa-airtype')
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, 'config.json')
+
+def load_config() -> dict:
+    """加载配置"""
+    try:
+        config_path = get_config_path()
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_config(config: dict):
+    """保存配置"""
+    try:
+        config_path = get_config_path()
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存配置失败: {e}")
 
 # --- 资源路径处理 ---
 def get_icon_path():
@@ -252,6 +293,147 @@ def send_shift_insert_windows():
         print(f"Windows API error: {e}")
         return False
 
+
+def paste_text(text):
+    """复制到剪切板并粘贴"""
+    pyperclip.copy(text)
+    time.sleep(0.1)
+    if IS_WINDOWS:
+        if not send_shift_insert_windows():
+            pyautogui.hotkey('shift', 'insert')
+    else:
+        pyautogui.hotkey('shift', 'insert')
+
+
+# --- CF 模式：cfchat 加密协议 ---
+def derive_key_and_room(password: str) -> tuple:
+    """从密码派生 AES 密钥和房间 ID"""
+    password = password.strip() or 'noset'
+    encoded = password.encode('utf-8')
+    hash_bytes = hashlib.sha256(encoded).digest()
+    room_id = hash_bytes.hex()
+    return hash_bytes, room_id
+
+
+def decrypt_message(key: bytes, iv_b64: str, data_b64: str) -> str:
+    """AES-GCM 解密消息"""
+    import base64
+    iv = base64.b64decode(iv_b64)
+    data = base64.b64decode(data_b64)
+    aesgcm = AESGCM(key)
+    plaintext = aesgcm.decrypt(iv, data, None)
+    return plaintext.decode('utf-8')
+
+
+class CFChatClient:
+    """CF 模式 WebSocket 客户端"""
+    def __init__(self, worker_url: str, password: str, on_message=None, on_status=None):
+        self.worker_url = worker_url.rstrip('/')
+        self.password = password
+        self.on_message = on_message
+        self.on_status = on_status
+        self.key, self.room_id = derive_key_and_room(password)
+        self.ws = None
+        self.running = False
+        self._loop = None
+        self._thread = None
+
+    def _get_ws_url(self) -> str:
+        """构建 WebSocket URL"""
+        url = self.worker_url
+        if url.startswith('https://'):
+            url = 'wss://' + url[8:]
+        elif url.startswith('http://'):
+            url = 'ws://' + url[7:]
+        elif not url.startswith('ws'):
+            url = 'wss://' + url
+        return f"{url}/ws/{self.room_id}"
+
+    async def _connect(self):
+        """连接并监听消息"""
+        ws_url = self._get_ws_url()
+        if self.on_status:
+            self.on_status('connecting', '连接中...')
+
+        try:
+            async with websockets.connect(ws_url) as ws:
+                self.ws = ws
+                if self.on_status:
+                    self.on_status('connected', '已连接 CF')
+
+                while self.running:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        self._handle_message(raw)
+                    except asyncio.TimeoutError:
+                        continue
+                    except websockets.ConnectionClosed:
+                        break
+
+        except Exception as e:
+            if self.on_status:
+                self.on_status('error', f'连接失败: {e}')
+
+        finally:
+            self.ws = None
+            if self.on_status and self.running:
+                self.on_status('disconnected', '已断开，重连中...')
+
+    def _handle_message(self, raw: str):
+        """处理收到的消息"""
+        try:
+            payload = json.loads(raw)
+            msg_type = payload.get('type', 'text').lower()
+
+            if msg_type != 'text':
+                return
+
+            iv = payload.get('iv')
+            data = payload.get('data')
+            if not iv or not data:
+                return
+
+            text = decrypt_message(self.key, iv, data)
+            if self.on_message:
+                self.on_message(text)
+
+        except Exception as e:
+            print(f"消息处理错误: {e}")
+
+    def _run_loop(self):
+        """在独立线程运行事件循环"""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+
+        while self.running:
+            try:
+                self._loop.run_until_complete(self._connect())
+            except Exception as e:
+                print(f"连接错误: {e}")
+
+            if self.running:
+                time.sleep(2)
+
+        self._loop.close()
+
+    def start(self):
+        """启动客户端"""
+        if self.running:
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """停止客户端"""
+        self.running = False
+        if self.ws and self._loop:
+            try:
+                asyncio.run_coroutine_threadsafe(self.ws.close(), self._loop)
+            except:
+                pass
+
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -372,8 +554,9 @@ class ServerApp:
         self.root = root
         self.root.title("QAA AirType")
         # 增加高度以容纳二维码
-        self.root.geometry("380x500")
-        self.root.resizable(False, False)
+        self.root.geometry("512x640")
+        self.root.resizable(True, True)
+        self.root.minsize(380, 480)  # 最小尺寸
 
         # 绑定窗口关闭事件（正常退出）
         self.root.protocol('WM_DELETE_WINDOW', self.quit_app)
@@ -389,47 +572,85 @@ class ServerApp:
         # 系统托盘图标
         self.tray_icon = None
         self.create_tray_icon()
-        
+
         # 居中屏幕
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        x = (screen_width - 380) // 2
-        y = (screen_height - 500) // 2
-        self.root.geometry(f"380x500+{x}+{y}")
+        x = (screen_width - 512) // 2
+        y = (screen_height - 640) // 2
+        self.root.geometry(f"512x640+{x}+{y}")
 
         self.all_ips = get_all_ips()
         self.ip_var = tk.StringVar(value=self.all_ips[0])
-        self.port_var = tk.StringVar(value="5000")
         self.is_running = False
+        self.cf_client = None  # CF 模式客户端
+        self.cf_mode = False   # 是否为 CF 模式
+
+        # 加载配置
+        self.config = load_config()
+        saved_mode = self.config.get('mode', 'lan')  # lan 或 cf
+        saved_port = self.config.get('port', '5000')
+        saved_ip = self.config.get('ip', '')
+        saved_cf_url = self.config.get('cf_url', '')
+        saved_cf_key = self.config.get('cf_key', '')
+
+        # 在 IP 列表末尾添加 CF 模式选项
+        self.all_ips.append('Cloudflare Chat Workers')
 
         # 主容器
         main_frame = tk.Frame(root, padx=20, pady=20)
         main_frame.pack(expand=True, fill='both')
 
-        # IP 和 端口 设置
-        tk.Label(main_frame, text="本机 IP:", font=("Arial", 10, "bold")).pack(anchor='w')
+        # 模式/IP 选择
+        tk.Label(main_frame, text="连接模式:", font=("Arial", 10, "bold")).pack(anchor='w')
         self.ip_combo = ttk.Combobox(main_frame, textvariable=self.ip_var,
-                                     values=self.all_ips, font=("Arial", 10), state='normal')
+                                     values=self.all_ips, font=("Arial", 10), state='readonly')
         self.ip_combo.pack(fill='x', pady=(0, 10))
-        # 绑定 IP 改变事件
-        self.ip_combo.bind('<<ComboboxSelected>>', self.on_ip_changed)
+        self.ip_combo.bind('<<ComboboxSelected>>', self.on_mode_changed)
 
-        tk.Label(main_frame, text="端口 (Port):", font=("Arial", 10, "bold")).pack(anchor='w')
-        self.port_entry = tk.Entry(main_frame, textvariable=self.port_var, font=("Arial", 10))
-        self.port_entry.pack(fill='x', pady=(0, 15))
+        # --- 局域网模式控件 ---
+        self.lan_frame = tk.Frame(main_frame)
+        self.lan_frame.pack(fill='x', pady=(0, 10))
+
+        tk.Label(self.lan_frame, text="端口:", font=("Arial", 10, "bold")).pack(anchor='w')
+        self.port_var = tk.StringVar(value=saved_port)
+        self.port_entry = tk.Entry(self.lan_frame, textvariable=self.port_var, font=("Arial", 10))
+        self.port_entry.pack(fill='x')
+
+        # --- CF 模式控件 ---
+        self.cf_frame = tk.Frame(main_frame)
+        # 默认隐藏，选择 CF 模式时显示
+
+        tk.Label(self.cf_frame, text="CF Worker 地址:", font=("Arial", 10, "bold")).pack(anchor='w')
+        self.cf_url_var = tk.StringVar(value=saved_cf_url)
+        self.cf_url_entry = tk.Entry(self.cf_frame, textvariable=self.cf_url_var, font=("Arial", 10))
+        self.cf_url_entry.pack(fill='x', pady=(0, 10))
+
+        tk.Label(self.cf_frame, text="共享密钥:", font=("Arial", 10, "bold")).pack(anchor='w')
+        self.cf_key_var = tk.StringVar(value=saved_cf_key)
+        self.cf_key_entry = tk.Entry(self.cf_frame, textvariable=self.cf_key_var, font=("Arial", 10), show="*")
+        self.cf_key_entry.pack(fill='x')
+
+        # 恢复保存的模式
+        if saved_mode == 'cf':
+            self.ip_var.set('Cloudflare Chat Workers')
+            self.lan_frame.pack_forget()
+            self.cf_frame.pack(fill='x', pady=(0, 10))
+        elif saved_ip and saved_ip in self.all_ips:
+            self.ip_var.set(saved_ip)
 
         # 按钮组
-        button_frame = tk.Frame(main_frame)
-        button_frame.pack(fill='x', pady=(0, 20))
+        self.button_frame = tk.Frame(main_frame)
+        self.button_frame.pack(fill='x', pady=(0, 20))
 
         # 启动按钮
-        self.btn_start = tk.Button(button_frame, text="启动服务", command=self.toggle_server,
+        self.btn_start = tk.Button(self.button_frame, text="启动服务", command=self.toggle_server,
                                    bg="#007AFF", fg="white", font=("Arial", 12, "bold"),
                                    relief="flat", pady=8, cursor="hand2")
         self.btn_start.pack(side='left', fill='x', expand=True, padx=(0, 5))
 
         # 最小化到托盘按钮
-        self.btn_minimize = tk.Button(button_frame, text="🔽", command=self.hide_window,
+        self.btn_minimize = tk.Button(self.button_frame, text="🔽", command=self.hide_window,
                                       bg="#8e8e93", fg="white", font=("Arial", 12, "bold"),
                                       relief="flat", pady=8, cursor="hand2", width=3)
         self.btn_minimize.pack(side='right')
@@ -453,7 +674,8 @@ class ServerApp:
 
     def show_all_ips_display(self, port, started=False):
         """显示所有可用 IP 地址列表"""
-        all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0')]
+        # 过滤掉 0.0.0.0 和 Cloudflare 选项
+        all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare')]
         ip_list = '\n'.join([f"http://{ip}:{port}" for ip in all_ips])
 
         if started:
@@ -500,92 +722,195 @@ class ServerApp:
             self.quit_app()
             return
 
-        port_str = self.port_var.get()
+        selected = self.ip_var.get()
+
+        # 判断模式并启动
+        if selected == 'Cloudflare Chat Workers':
+            # 保存 CF 配置
+            self.config['mode'] = 'cf'
+            self.config['cf_url'] = self.cf_url_var.get()
+            self.config['cf_key'] = self.cf_key_var.get()
+            save_config(self.config)
+            self.start_cf_mode()
+        else:
+            # 保存局域网配置
+            self.config['mode'] = 'lan'
+            self.config['port'] = self.port_var.get()
+            self.config['ip'] = selected
+            save_config(self.config)
+            self.start_lan_mode()
+
+    def parse_cf_config(self, config: str) -> tuple:
+        """解析 CF 配置：key@url（保留兼容）"""
+        if '@' not in config:
+            return '', config
+        at_pos = config.find('@')
+        key = config[:at_pos]
+        url = config[at_pos + 1:]
+        return key, url
+
+    def start_cf_mode(self):
+        """启动 CF 模式"""
+        if not CF_AVAILABLE:
+            messagebox.showerror("错误", "CF 模式需要安装依赖:\npip install websockets cryptography")
+            return
+
+        url = self.cf_url_var.get().strip()
+        key = self.cf_key_var.get()
+
+        if not url:
+            messagebox.showerror("错误", "请输入 CF Worker 地址")
+            return
+
+        # 确保 URL 有协议
+        if not url.startswith('http'):
+            url = 'https://' + url
+
+        self.cf_mode = True
+        self.cf_url = url
+        self.cf_key = key
+
+        # 创建 CF 客户端
+        self.cf_client = CFChatClient(
+            worker_url=url,
+            password=key,
+            on_message=self.on_cf_message,
+            on_status=self.on_cf_status
+        )
+        self.cf_client.start()
+
+        self.is_running = True
+        self.btn_start.config(text="停止服务并退出", bg="#ff3b30")
+        self.cf_url_entry.config(state='disabled', bg="#f0f0f0")
+        self.cf_key_entry.config(state='disabled', bg="#f0f0f0")
+        self.ip_combo.config(state='disabled')
+
+        # 显示 cfchat URL 的二维码
+        try:
+            qr_size = min(self.root.winfo_width() - 80, 250)
+            self.qr_img = self.generate_qr(url, target_size=qr_size)
+            self.qr_label.config(image=self.qr_img, width=qr_size, height=qr_size,
+                                bg="white", text='', font=("Arial", 10))
+        except Exception as e:
+            self.qr_label.config(text=f"二维码生成失败\n{e}")
+
+        self.url_label.config(text=url)
+        self.current_url = url
+        self.tip_label.config(text="CF 模式：手机访问上方链接发送消息")
+
+    def start_lan_mode(self):
+        """启动局域网模式"""
+        port_str = self.port_var.get().strip()
+
         if not port_str.isdigit():
             messagebox.showerror("错误", "端口必须是数字")
             return
 
+        self.cf_mode = False
         port = int(port_str)
         host_ip = self.ip_var.get()
 
         # 确定监听地址
         if host_ip.startswith('0.0.0.0'):
-            listen_host = '0.0.0.0'  # 监听所有网卡
+            listen_host = '0.0.0.0'
         else:
-            listen_host = host_ip  # 只监听指定 IP
+            listen_host = host_ip
 
         # 启动 Flask 线程
         t = threading.Thread(target=self.run_flask, args=(listen_host, port), daemon=True)
         t.start()
 
         self.is_running = True
-        self.listen_on_all = host_ip.startswith('0.0.0.0')  # 记录是否监听所有网卡
+        self.listen_on_all = host_ip.startswith('0.0.0.0')
         self.btn_start.config(text="停止服务并退出", state='normal', bg="#ff3b30")
-
-        # 禁用端口输入框
         self.port_entry.config(state='disabled', bg="#f0f0f0")
 
-        # 如果选择的是具体 IP，禁用 IP 下拉框
         if not self.listen_on_all:
             self.ip_combo.config(state='disabled')
 
-        # 处理 "0.0.0.0 (所有网卡)" 的情况
         if host_ip.startswith('0.0.0.0'):
-            # 显示所有可用的 IP 地址
             self.show_all_ips_display(port, started=True)
-            all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0')]
+            all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare')]
             self.url_label.config(text="请手动输入上方地址")
             self.current_url = f"http://{all_ips[0]}:{port}" if all_ips else ""
             self.tip_label.config(text="")
         else:
-            # 生成并显示二维码（动态调整大小）
             url = f"http://{host_ip}:{port}"
             try:
-                # 获取当前窗口大小，动态计算二维码尺寸
-                qr_size = min(self.root.winfo_width() - 80, 250)  # 最大250px
-                self.qr_img = self.generate_qr(url, target_size=qr_size) # 必须保持引用，否则会被垃圾回收
-                self.qr_label.config(image=self.qr_img, width=qr_size, height=qr_size, bg="white", text='', font=("Arial", 10))
+                qr_size = min(self.root.winfo_width() - 80, 250)
+                self.qr_img = self.generate_qr(url, target_size=qr_size)
+                self.qr_label.config(image=self.qr_img, width=qr_size, height=qr_size,
+                                    bg="white", text='', font=("Arial", 10))
             except Exception as e:
                 self.qr_label.config(text=f"二维码生成失败\n{e}")
 
-            # 显示文本链接
             self.url_label.config(text=url)
             self.current_url = url
             self.tip_label.config(text="提示：如无法访问，请切换 IP 或端口重新扫码")
 
-    def on_ip_changed(self, event=None):
-        """当 IP 改变时更新二维码"""
-        # 只有在运行中且启动时选择了 0.0.0.0 才允许切换
-        if not self.is_running:
-            return
+    def on_cf_message(self, text: str):
+        """CF 模式收到消息回调"""
+        self.root.after(0, lambda: self._handle_cf_message(text))
 
-        # 如果启动时不是 0.0.0.0 模式，不允许切换
-        if not hasattr(self, 'listen_on_all') or not self.listen_on_all:
-            return
+    def _handle_cf_message(self, text: str):
+        """处理 CF 消息并粘贴"""
+        paste_text(text)
+        # 更新提示
+        display = text[:30] + '...' if len(text) > 30 else text
+        self.tip_label.config(text=f"已粘贴: {display}")
 
+    def on_cf_status(self, state: str, text: str):
+        """CF 模式状态回调"""
+        self.root.after(0, lambda: self._update_cf_status(state, text))
+
+    def _update_cf_status(self, state: str, text: str):
+        """更新 CF 状态显示"""
+        colors = {
+            'connected': '#34c759',
+            'connecting': '#f59e0b',
+            'disconnected': '#888',
+            'error': '#ff3b30'
+        }
+        self.tip_label.config(text=text, fg=colors.get(state, '#888'))
+
+    def on_mode_changed(self, event=None):
+        """模式/IP 改变时切换界面"""
+        selected = self.ip_var.get()
+
+        if selected == 'Cloudflare Chat Workers':
+            # 切换到 CF 模式界面
+            self.lan_frame.pack_forget()
+            self.cf_frame.pack(fill='x', pady=(0, 10), before=self.button_frame)
+        else:
+            # 切换到局域网模式界面
+            self.cf_frame.pack_forget()
+            self.lan_frame.pack(fill='x', pady=(0, 10), before=self.button_frame)
+
+            # 如果运行中且是 0.0.0.0 模式，更新二维码
+            if self.is_running and hasattr(self, 'listen_on_all') and self.listen_on_all:
+                self._update_lan_qr()
+
+    def _update_lan_qr(self):
+        """更新局域网模式二维码"""
         host_ip = self.ip_var.get()
         port = int(self.port_var.get())
 
-        # 处理 "0.0.0.0 (所有网卡)" 的情况
         if host_ip.startswith('0.0.0.0'):
-            # 显示所有可用的 IP 地址
             self.show_all_ips_display(port, started=True)
-            all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0')]
+            all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare')]
             self.url_label.config(text="请手动输入上方地址")
             self.current_url = f"http://{all_ips[0]}:{port}" if all_ips else ""
             self.tip_label.config(text="")
         else:
-            # 生成并显示二维码（动态调整大小）
             url = f"http://{host_ip}:{port}"
             try:
-                # 获取当前窗口大小，动态计算二维码尺寸
-                qr_size = min(self.root.winfo_width() - 80, 250)  # 最大250px
+                qr_size = min(self.root.winfo_width() - 80, 250)
                 self.qr_img = self.generate_qr(url, target_size=qr_size)
-                self.qr_label.config(image=self.qr_img, width=qr_size, height=qr_size, bg="white", text='', font=("Arial", 10))
+                self.qr_label.config(image=self.qr_img, width=qr_size, height=qr_size,
+                                    bg="white", text='', font=("Arial", 10))
             except Exception as e:
                 self.qr_label.config(text=f"二维码生成失败\n{e}")
 
-            # 显示文本链接
             self.url_label.config(text=url)
             self.current_url = url
             self.tip_label.config(text="提示：如无法访问，请切换 IP 重新扫码")
@@ -630,6 +955,10 @@ class ServerApp:
 
     def quit_app(self, icon=None, item=None):
         """退出应用"""
+        # 停止 CF 客户端
+        if self.cf_client:
+            self.cf_client.stop()
+            self.cf_client = None
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.quit()

@@ -34,7 +34,10 @@ QAA AirType 是一个轻量级的局域网输入板，让你可以通过手机�
 - 📱 **扫码即用**：启动程序后扫描二维码即可连接
 - 📝 **历史记录**：保存最近10条输入记录，支持快速重发
 - 🌐 **局域网连接**：无需互联网，局域网内即可使用
+- ☁️ **跨网络支持**：通过 Cloudflare Workers 突破局域网限制
 - 🔽 **系统托盘**：最小化到托盘，不占用任务栏
+
+📖 **详细文档**：[https://qaa-tools.github.io/qaa-airtype/](https://qaa-tools.github.io/qaa-airtype/)
 
 ## 🚀 快速开始
 
