@@ -26,7 +26,7 @@ try:
     import websockets
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     CF_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     CF_AVAILABLE = False
 
 # --- 配置文件 ---
@@ -60,6 +60,63 @@ def save_config(config: dict):
         print(f"保存配置失败: {e}")
 
 # --- 资源路径处理 ---
+def get_base_path():
+    """获取基础路径，支持开发环境和打包后的环境"""
+    if getattr(sys, 'frozen', False):
+        # 打包后的exe文件
+        return os.path.dirname(sys.executable)
+    else:
+        # 开发环境
+        return os.path.dirname(os.path.abspath(__file__))
+
+def load_theme(theme_name=None):
+    """加载主题HTML文件"""
+    base_path = get_base_path()
+
+    # 优先级1: URL参数指定的主题
+    if theme_name and theme_name != 'default':
+        theme_path = os.path.join(base_path, f"{theme_name}.html")
+        if os.path.exists(theme_path):
+            try:
+                with open(theme_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            except Exception:
+                pass
+
+    # 优先级2: custom.html
+    custom_path = os.path.join(base_path, "custom.html")
+    if os.path.exists(custom_path):
+        try:
+            with open(custom_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception:
+            pass
+
+    # 优先级3: default.html
+    if getattr(sys, 'frozen', False):
+        # 打包模式：从PyInstaller临时目录加载
+        if hasattr(sys, '_MEIPASS'):
+            default_path = os.path.join(sys._MEIPASS, "default.html")
+        else:
+            default_path = os.path.join(base_path, "default.html")
+    else:
+        # 源代码模式：从src目录加载
+        default_path = os.path.join(base_path, "default.html")
+
+    if os.path.exists(default_path):
+        try:
+            with open(default_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception:
+            pass
+
+    # 回退到基本错误页面
+    return """
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>主题加载失败</title></head>
+<body><h1>主题加载失败</h1><p>请检查主题文件是否存在</p></body>
+</html>"""
+
 def get_icon_path():
     """获取图标路径，支持开发环境和打包后的环境"""
     # 如果是 PyInstaller 打包的程序
@@ -79,174 +136,7 @@ app = Flask(__name__)
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-# --- HTML 模板 (保持之前的历史记录功能) ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>无线键盘</title>
-    <style>
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
-            padding: 20px; 
-            text-align: center; 
-            background-color: #f5f5f7; 
-            color: #333;
-        }
-        h2 { margin-bottom: 20px; font-weight: 600; }
-        .input-group { margin-bottom: 15px; }
-        input[type="text"] {
-            width: 100%; padding: 15px; font-size: 16px; border-radius: 12px;
-            border: 1px solid #d1d1d6; box-sizing: border-box; outline: none;
-            background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-            transition: border-color 0.2s;
-        }
-        input[type="text"]:focus { border-color: #007AFF; }
-        .button-group { display: flex; gap: 10px; margin-bottom: 15px; }
-        button {
-            flex: 1; padding: 15px; font-size: 18px; color: white;
-            border: none; border-radius: 12px; cursor: pointer; font-weight: 600;
-            transition: background-color 0.1s, transform 0.1s;
-        }
-        button#sendBtn {
-            background-color: #007AFF;
-            box-shadow: 0 4px 6px rgba(0,122,255,0.2);
-        }
-        button#sendBtn:active { background-color: #0056b3; transform: scale(0.98); }
-        button#clearBtn {
-            background-color: #8e8e93;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        button#clearBtn:active { background-color: #636366; transform: scale(0.98); }
-        #status { margin-top: 10px; height: 20px; font-size: 14px; color: #34c759; font-weight: 500;}
-        .history-container { margin-top: 30px; text-align: left; }
-        .history-header { 
-            font-size: 14px; color: #888; margin-bottom: 10px; 
-            display: flex; justify-content: space-between; align-items: center;
-        }
-        .clear-btn { color: #ff3b30; cursor: pointer; font-size: 12px; }
-        .history-list { list-style: none; padding: 0; margin: 0; }
-        .history-item {
-            background: #fff; padding: 12px; margin-bottom: 8px; border-radius: 8px;
-            border: 1px solid #e5e5ea; cursor: pointer;
-            display: flex; align-items: center; justify-content: space-between;
-            transition: background 0.1s;
-        }
-        .history-item:active { background: #f0f0f0; }
-        .history-text { 
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; 
-            max-width: 85%; font-size: 14px;
-        }
-        .history-arrow { color: #c7c7cc; font-size: 18px; }
-    </style>
-</head>
-<body>
-    <h2>电脑远程输入板</h2>
-    <div class="input-group">
-        <input type="text" id="textInput" placeholder="输入文字..." autofocus autocomplete="off">
-    </div>
-    <div class="button-group">
-        <button id="clearBtn" onclick="handleClear()">清空</button>
-        <button id="sendBtn" onclick="handleSend()">发送 (Ent)</button>
-    </div>
-    <div id="status"></div>
-    <div class="history-container">
-        <div class="history-header">
-            <span>最近记录 (点击重发)</span>
-            <span class="clear-btn" onclick="clearHistory()">清空</span>
-        </div>
-        <ul id="historyList" class="history-list"></ul>
-    </div>
-    <script>
-        const input = document.getElementById('textInput');
-        const status = document.getElementById('status');
-        const historyList = document.getElementById('historyList');
-        const MAX_HISTORY = 10;
-
-        window.onload = function() { renderHistory(); }
-
-        // 回车发送
-        input.addEventListener("keypress", function(event) {
-            if (event.key === "Enter") { event.preventDefault(); handleSend(); }
-        });
-
-        // 点击页面任意位置聚焦输入框（除了按钮和历史记录）
-        document.body.addEventListener('click', function(event) {
-            const target = event.target;
-            // 如果点击的不是按钮、历史记录项、清空按钮，则聚焦输入框
-            if (!target.closest('button') &&
-                !target.closest('.history-item') &&
-                !target.closest('.clear-btn') &&
-                target !== input) {
-                input.focus();
-            }
-        });
-        function handleSend() {
-            const text = input.value.trim();
-            if (!text) return;
-            saveToHistory(text);
-            sendRequest(text);
-        }
-        function handleClear() {
-            input.value = '';
-            input.focus();
-        }
-        function sendRequest(text) {
-            status.innerText = "发送中...";
-            status.style.color = "#888";
-            fetch('/type', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: text })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    status.innerText = "✓ 已发送";
-                    status.style.color = "#34c759";
-                    input.value = ''; 
-                    setTimeout(() => status.innerText = "", 1500);
-                } else { throw new Error("Server error"); }
-            })
-            .catch(err => {
-                status.innerText = "✕ 发送失败";
-                status.style.color = "#ff3b30";
-            });
-        }
-        function getHistory() {
-            const stored = localStorage.getItem('typeHistory');
-            return stored ? JSON.parse(stored) : [];
-        }
-        function saveToHistory(text) {
-            let history = getHistory();
-            history = history.filter(item => item !== text);
-            history.unshift(text);
-            if (history.length > MAX_HISTORY) { history = history.slice(0, MAX_HISTORY); }
-            localStorage.setItem('typeHistory', JSON.stringify(history));
-            renderHistory();
-        }
-        function renderHistory() {
-            const history = getHistory();
-            historyList.innerHTML = '';
-            history.forEach(text => {
-                const li = document.createElement('li');
-                li.className = 'history-item';
-                li.onclick = () => { input.value = text; handleSend(); };
-                li.innerHTML = `<span class="history-text">${escapeHtml(text)}</span><span class="history-arrow">⤶</span>`;
-                historyList.appendChild(li);
-            });
-        }
-        function clearHistory() { localStorage.removeItem('typeHistory'); renderHistory(); }
-        function escapeHtml(text) {
-            const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
-            return text.replace(/[&<>"']/g, function(m) { return map[m]; });
-        }
-    </script>
-</body>
-</html>
-"""
+# --- 主题系统 ---
 
 IS_MAC = platform.system() == 'Darwin'
 IS_WINDOWS = platform.system() == 'Windows'
@@ -436,7 +326,8 @@ class CFChatClient:
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    theme = request.args.get('theme')
+    return load_theme(theme)
 
 @app.route('/type', methods=['POST'])
 def type_text():

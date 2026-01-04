@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>无线键盘 - 智能输入</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            padding: 20px;
+            text-align: center;
+            background-color: #f5f5f7;
+            color: #333;
+        }
+        h2 { margin-bottom: 20px; font-weight: 600; }
+        .input-group { margin-bottom: 15px; }
+        input[type="text"] {
+            width: 100%; padding: 20px; font-size: 18px; border-radius: 12px;
+            border: 1px solid #d1d1d6; box-sizing: border-box; outline: none;
+            background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus { border-color: #007AFF; }
+        .mode-group {
+            display: flex; gap: 5px; margin-bottom: 15px; flex-wrap: wrap;
+            justify-content: center;
+        }
+        .mode-btn {
+            padding: 8px 12px; font-size: 12px; color: #666;
+            border: 1px solid #d1d1d6; border-radius: 8px; cursor: pointer;
+            background: #fff; transition: all 0.2s;
+        }
+        .mode-btn.active {
+            background: #007AFF; color: #fff; border-color: #007AFF;
+        }
+        .button-group { display: flex; gap: 10px; margin-bottom: 15px; }
+        button {
+            flex: 1; padding: 15px; font-size: 18px; color: white;
+            border: none; border-radius: 12px; cursor: pointer; font-weight: 600;
+            transition: background-color 0.1s, transform 0.1s;
+        }
+        button#sendBtn {
+            background-color: #007AFF;
+            box-shadow: 0 4px 6px rgba(0,122,255,0.2);
+        }
+        button#sendBtn:active { background-color: #0056b3; transform: scale(0.98); }
+        button#clearBtn {
+            background-color: #8e8e93;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        button#clearBtn:active { background-color: #636366; transform: scale(0.98); }
+        #status { margin-top: 10px; height: 20px; font-size: 14px; color: #34c759; font-weight: 500;}
+        .history-container { margin-top: 30px; text-align: left; }
+        .history-header {
+            font-size: 14px; color: #888; margin-bottom: 10px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .clear-btn { color: #ff3b30; cursor: pointer; font-size: 12px; }
+        .history-list { list-style: none; padding: 0; margin: 0; }
+        .history-item {
+            background: #fff; padding: 12px; margin-bottom: 8px; border-radius: 8px;
+            border: 1px solid #e5e5ea; cursor: pointer;
+            display: flex; align-items: center; justify-content: space-between;
+            transition: background 0.1s;
+        }
+        .history-item:active { background: #f0f0f0; }
+        .history-text {
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            max-width: 85%; font-size: 14px;
+        }
+        .history-arrow { color: #c7c7cc; font-size: 18px; }
+        .auto-indicator { color: #007AFF; font-size: 10px; margin-left: 5px; }
+    </style>
+</head>
+<body>
+    <h2>⚡ 智能输入板</h2>
+    <div class="input-group">
+        <input type="text" id="textInput" placeholder="输入文字..." autofocus autocomplete="off">
+    </div>
+    <div class="mode-group">
+        <div class="mode-btn active" data-mode="manual">手动</div>
+        <div class="mode-btn" data-mode="100">0.1s</div>
+        <div class="mode-btn" data-mode="500">0.5s</div>
+        <div class="mode-btn" data-mode="1000">1s</div>
+        <div class="mode-btn" data-mode="10000">10s</div>
+    </div>
+    <div class="button-group">
+        <button id="clearBtn" onclick="handleClear()">清空</button>
+        <button id="sendBtn" onclick="handleSend()">发送</button>
+    </div>
+    <div id="status"></div>
+    <div class="history-container">
+        <div class="history-header">
+            <span>历史记录</span>
+            <span class="clear-btn" onclick="clearHistory()">清空</span>
+        </div>
+        <ul id="historyList" class="history-list"></ul>
+    </div>
+    <script>
+        const input = document.getElementById('textInput');
+        const status = document.getElementById('status');
+        const historyList = document.getElementById('historyList');
+        const MAX_HISTORY = 10;
+
+        let currentMode = 'manual';
+        let autoTimer = null;
+        let lastAutoSendTime = 0;
+        let currentAutoGroup = [];
+
+        window.onload = function() { renderHistory(); }
+
+        document.querySelectorAll('.mode-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                currentMode = this.dataset.mode;
+
+                if (autoTimer) {
+                    clearInterval(autoTimer);
+                    autoTimer = null;
+                }
+
+                if (currentMode !== 'manual') {
+                    startAutoMode();
+                }
+            });
+        });
+
+        function startAutoMode() {
+            const interval = parseInt(currentMode);
+            autoTimer = setInterval(() => {
+                const text = input.value.trim();
+                if (text) {
+                    handleAutoSend(text);
+                }
+            }, interval);
+        }
+
+        input.addEventListener("keypress", function(event) {
+            if (event.key === "Enter") { event.preventDefault(); handleSend(); }
+        });
+
+        document.body.addEventListener('click', function(event) {
+            const target = event.target;
+            if (!target.closest('button') &&
+                !target.closest('.history-item') &&
+                !target.closest('.clear-btn') &&
+                !target.closest('.mode-btn') &&
+                target !== input) {
+                input.focus();
+            }
+        });
+
+        function handleSend() {
+            const text = input.value.trim();
+            if (!text) return;
+            saveToHistory(text, false);
+            sendRequest(text);
+        }
+
+        function handleAutoSend(text) {
+            const now = Date.now();
+
+            if (now - lastAutoSendTime > 10000) {
+                if (currentAutoGroup.length > 0) {
+                    saveAutoGroupToHistory();
+                }
+                currentAutoGroup = [];
+            }
+
+            currentAutoGroup.push(text);
+            lastAutoSendTime = now;
+            sendRequest(text);
+
+            // 立即更新历史记录显示
+            updateAutoGroupDisplay();
+        }
+
+        function updateAutoGroupDisplay() {
+            if (currentAutoGroup.length === 0) return;
+
+            const groupText = currentAutoGroup.join(' ');
+            let history = getHistory();
+
+            // 移除之前的临时组记录
+            history = history.filter(item => !item.isTemp);
+
+            // 添加当前组作为临时记录
+            history.unshift({ text: groupText, isAuto: true, isTemp: true });
+
+            if (history.length > MAX_HISTORY) { history = history.slice(0, MAX_HISTORY); }
+            renderHistoryFromArray(history);
+        }
+
+        function saveAutoGroupToHistory() {
+            if (currentAutoGroup.length === 0) return;
+
+            const groupText = currentAutoGroup.join(' ');
+            let history = getHistory();
+
+            // 移除临时记录和重复记录
+            history = history.filter(item => !item.isTemp && item.text !== groupText);
+
+            // 添加正式记录
+            history.unshift({ text: groupText, isAuto: true });
+            if (history.length > MAX_HISTORY) { history = history.slice(0, MAX_HISTORY); }
+            localStorage.setItem('typeHistory', JSON.stringify(history));
+            renderHistory();
+        }
+
+        function handleClear() {
+            input.value = '';
+            input.focus();
+        }
+
+        function sendRequest(text) {
+            status.innerText = "发送中...";
+            status.style.color = "#888";
+            fetch('/type', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    status.innerText = "✓ 已发送";
+                    status.style.color = "#34c759";
+                    input.value = '';
+                    setTimeout(() => status.innerText = "", 1500);
+                } else { throw new Error("Server error"); }
+            })
+            .catch(err => {
+                status.innerText = "✕ 发送失败";
+                status.style.color = "#ff3b30";
+            });
+        }
+
+        function getHistory() {
+            const stored = localStorage.getItem('typeHistory');
+            if (!stored) return [];
+
+            const parsed = JSON.parse(stored);
+            return parsed.map(item =>
+                typeof item === 'string' ? { text: item, isAuto: false } : item
+            );
+        }
+
+        function saveToHistory(text, isAuto = false) {
+            let history = getHistory();
+            const newItem = { text: text, isAuto: isAuto };
+            history = history.filter(item => item.text !== text);
+            history.unshift(newItem);
+            if (history.length > MAX_HISTORY) { history = history.slice(0, MAX_HISTORY); }
+            localStorage.setItem('typeHistory', JSON.stringify(history));
+            renderHistory();
+        }
+
+        function renderHistory() {
+            const history = getHistory();
+            renderHistoryFromArray(history);
+        }
+
+        function renderHistoryFromArray(history) {
+            historyList.innerHTML = '';
+            history.forEach(item => {
+                const li = document.createElement('li');
+                li.className = 'history-item';
+                li.onclick = () => { input.value = item.text; handleSend(); };
+                const indicator = item.isAuto ? '<span class="auto-indicator">AUTO</span>' : '';
+                const tempIndicator = item.isTemp ? '<span class="auto-indicator">...</span>' : '';
+                li.innerHTML = `<span class="history-text">${escapeHtml(item.text)}${indicator}${tempIndicator}</span><span class="history-arrow">⤶</span>`;
+                historyList.appendChild(li);
+            });
+        }
+
+        function clearHistory() {
+            localStorage.removeItem('typeHistory');
+            currentAutoGroup = [];
+            renderHistory();
+        }
+
+        function escapeHtml(text) {
+            const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+            return text.replace(/[&<>"']/g, function(m) { return map[m]; });
+        }
+
+        window.addEventListener('beforeunload', function() {
+            if (currentAutoGroup.length > 0) {
+                saveAutoGroupToHistory();
+            }
+        });
+    </script>
+</body>
+</html>
