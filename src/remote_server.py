@@ -503,10 +503,22 @@ class ServerApp:
         self.lan_frame = tk.Frame(main_frame)
         self.lan_frame.pack(fill='x', pady=(0, 10))
 
-        tk.Label(self.lan_frame, text="端口:", font=("Arial", 10, "bold")).pack(anchor='w')
+        # 端口输入（标签和输入框在同一行）
+        port_row = tk.Frame(self.lan_frame)
+        port_row.pack(fill='x', pady=(0, 5))
+        tk.Label(port_row, text="端口:", font=("Arial", 10, "bold"), width=10, anchor='w').pack(side='left')
         self.port_var = tk.StringVar(value=saved_port)
-        self.port_entry = tk.Entry(self.lan_frame, textvariable=self.port_var, font=("Arial", 10))
-        self.port_entry.pack(fill='x')
+        self.port_entry = tk.Entry(port_row, textvariable=self.port_var, font=("Arial", 10))
+        self.port_entry.pack(side='left', fill='x', expand=True)
+
+        # 主题名称输入（标签和输入框在同一行）
+        theme_row = tk.Frame(self.lan_frame)
+        theme_row.pack(fill='x')
+        tk.Label(theme_row, text="主题名称:", font=("Arial", 10, "bold"), width=10, anchor='w').pack(side='left')
+        self.theme_var = tk.StringVar(value='')
+        self.theme_entry = tk.Entry(theme_row, textvariable=self.theme_var, font=("Arial", 10))
+        self.theme_entry.pack(side='left', fill='x', expand=True)
+        tk.Label(theme_row, text="如: xxx.html", font=("Arial", 8), fg="#888").pack(side='left', padx=(5, 0))
 
         # --- CF 模式控件 ---
         self.cf_frame = tk.Frame(main_frame)
@@ -722,11 +734,15 @@ class ServerApp:
         if host_ip.startswith('0.0.0.0'):
             self.show_all_ips_display(port, started=True)
             all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare')]
+            theme = self.theme_var.get().strip()
+            theme_param = f"?theme={theme}" if theme else ""
             self.url_label.config(text="请手动输入上方地址")
-            self.current_url = f"http://{all_ips[0]}:{port}" if all_ips else ""
+            self.current_url = f"http://{all_ips[0]}:{port}{theme_param}" if all_ips else ""
             self.tip_label.config(text="")
         else:
-            url = f"http://{host_ip}:{port}"
+            theme = self.theme_var.get().strip()
+            theme_param = f"?theme={theme}" if theme else ""
+            url = f"http://{host_ip}:{port}{theme_param}"
             try:
                 qr_size = min(self.root.winfo_width() - 80, 250)
                 self.qr_img = self.generate_qr(url, target_size=qr_size)
@@ -789,11 +805,15 @@ class ServerApp:
         if host_ip.startswith('0.0.0.0'):
             self.show_all_ips_display(port, started=True)
             all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare')]
+            theme = self.theme_var.get().strip()
+            theme_param = f"?theme={theme}" if theme else ""
             self.url_label.config(text="请手动输入上方地址")
-            self.current_url = f"http://{all_ips[0]}:{port}" if all_ips else ""
+            self.current_url = f"http://{all_ips[0]}:{port}{theme_param}" if all_ips else ""
             self.tip_label.config(text="")
         else:
-            url = f"http://{host_ip}:{port}"
+            theme = self.theme_var.get().strip()
+            theme_param = f"?theme={theme}" if theme else ""
+            url = f"http://{host_ip}:{port}{theme_param}"
             try:
                 qr_size = min(self.root.winfo_width() - 80, 250)
                 self.qr_img = self.generate_qr(url, target_size=qr_size)
