@@ -131,6 +131,7 @@
         const fontSizeSelect = document.getElementById('fontSizeSelect');
         const historyList = document.getElementById('historyList');
         const MAX_HISTORY = 10;
+        const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 
         let currentMode = 'manual';
         let autoTimer = null;
@@ -173,6 +174,15 @@
             heightSelect.addEventListener('change', applyHeight);
         }
 
+        input.addEventListener("keydown", function(event) {
+            if (isMobile) return;
+            if (event.key === "Enter") {
+                if (event.shiftKey) return;
+                event.preventDefault();
+                handleSend();
+            }
+        });
+
         document.querySelectorAll('.mode-btn').forEach(btn => {
             btn.addEventListener('click', function() {
                 document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
@@ -213,10 +223,6 @@
                 }
             }, interval);
         }
-
-        input.addEventListener("keypress", function(event) {
-            if (event.key === "Enter") { event.preventDefault(); handleSend(); }
-        });
 
         document.body.addEventListener('click', function(event) {
             const target = event.target;

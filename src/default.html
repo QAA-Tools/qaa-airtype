@@ -111,6 +111,7 @@
         const heightSelect = document.getElementById('heightSelect');
         const historyList = document.getElementById('historyList');
         const MAX_HISTORY = 10;
+        const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 
         function applyFontSize() {
             const size = fontSizeSelect.value;
@@ -148,8 +149,13 @@
             heightSelect.addEventListener('change', applyHeight);
         }
 
-        input.addEventListener("keypress", function(event) {
-            if (event.key === "Enter") { event.preventDefault(); handleSend(); }
+        input.addEventListener("keydown", function(event) {
+            if (isMobile) return;
+            if (event.key === "Enter") {
+                if (event.shiftKey) return;
+                event.preventDefault();
+                handleSend();
+            }
         });
 
         document.body.addEventListener('click', function(event) {
