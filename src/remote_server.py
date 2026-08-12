@@ -29,6 +29,13 @@ try:
 except (ImportError, RuntimeError):
     CF_AVAILABLE = False
 
+# MQTT 模式依赖（可选）
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = CF_AVAILABLE and hasattr(mqtt, 'Client')
+except (ImportError, RuntimeError):
+    MQTT_AVAILABLE = False
+
 # --- 配置文件 ---
 def get_config_path():
     """获取配置文件路径"""
@@ -73,15 +80,25 @@ def load_theme(theme_name=None):
     """加载主题HTML文件"""
     base_path = get_base_path()
 
-    # 优先级1: URL参数指定的主题
+
+    # 优先级1: URL参数指定的主题（exe/src 同目录、theme/ 目录）
     if theme_name and theme_name != 'default':
-        theme_path = os.path.join(base_path, f"{theme_name}.html")
-        if os.path.exists(theme_path):
-            try:
-                with open(theme_path, 'r', encoding='utf-8') as f:
-                    return f.read()
-            except Exception:
-                pass
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates = [
+            os.path.join(base_path, f"{theme_name}.html"),
+            os.path.join(base_path, "theme", f"{theme_name}.html"),
+            os.path.join(repo_root, "theme", f"{theme_name}.html"),
+        ]
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            candidates.insert(0, os.path.join(sys._MEIPASS, "theme", f"{theme_name}.html"))
+            candidates.insert(0, os.path.join(sys._MEIPASS, f"{theme_name}.html"))
+        for theme_path in candidates:
+            if os.path.exists(theme_path):
+                try:
+                    with open(theme_path, 'r', encoding='utf-8') as f:
+                        return f.read()
+                except Exception:
+                    pass
 
     # 优先级2: custom.html
     custom_path = os.path.join(base_path, "custom.html")
@@ -136,6 +153,41 @@ app = Flask(__name__)
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
+def get_static_base_path():
+    """获取 static 资源目录，兼容源码运行和 PyInstaller 打包"""
+    candidates = []
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        candidates.append(os.path.join(sys._MEIPASS, 'static'))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static'))
+    candidates.append(os.path.join(get_base_path(), 'static'))
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    """提供 mqtt.min.js 等手机端静态资源"""
+    from flask import send_file
+    base = os.path.normpath(get_static_base_path())
+    safe = os.path.normpath(filename).replace('\\', '/')
+    if safe.startswith('..') or os.path.isabs(filename):
+        return 'Not Found', 404
+    full = os.path.normpath(os.path.join(base, filename))
+    if not full.startswith(base) or not os.path.isfile(full):
+        return 'Not Found', 404
+    return send_file(full)
+
+@app.route('/__shutdown__', methods=['POST'])
+def shutdown_server():
+    """仅本机调用，用于停止 Flask 服务但不退出程序"""
+    if request.remote_addr not in ('127.0.0.1', '::1'):
+        return 'Forbidden', 403
+    shutdown = request.environ.get('werkzeug.server.shutdown')
+    if shutdown:
+        shutdown()
+    return 'ok'
+
 # --- 主题系统 ---
 
 IS_MAC = platform.system() == 'Darwin'
@@ -183,6 +235,21 @@ def send_shift_insert_windows():
         print(f"Windows API error: {e}")
         return False
 
+
+def send_enter_windows():
+    """使用 Windows API 发送回车键（兼容子线程）"""
+    if not IS_WINDOWS:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        enter_scan = user32.MapVirtualKeyW(0x0D, MAPVK_VK_TO_VSC)
+        user32.keybd_event(0x0D, enter_scan, KEYEVENTF_SCANCODE, 0)
+        time.sleep(0.03)
+        user32.keybd_event(0x0D, enter_scan, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0)
+        return True
+    except Exception as e:
+        print(f"Windows API error: {e}")
+        return False
 
 def paste_text(text):
     """复制到剪切板并粘贴"""
@@ -324,6 +391,142 @@ class CFChatClient:
                 pass
 
 
+# --- MQTT 模式：复用 cfchat 的 AES-GCM 协议，走国内 Broker 中转 ---
+MQTT_CHUNK_BYTES = 16 * 1024
+MQTT_CHUNK_TIMEOUT = 20
+
+def derive_mqtt_topic(password: str) -> str:
+    """由共享密钥派生 MQTT 主题，避免不同用户串扰"""
+    _, room_id = derive_key_and_room(password)
+    return f"qaa/{room_id}/in"
+
+def decrypt_bytes(key: bytes, iv_b64: str, data_b64: str) -> bytes:
+    """AES-GCM 解密字节数据（用于长文本分片）"""
+    import base64
+    iv = base64.b64decode(iv_b64)
+    data = base64.b64decode(data_b64)
+    return AESGCM(key).decrypt(iv, data, None)
+
+class MqttClient:
+    """MQTT 接收客户端：订阅加密主题，支持长文本分片重组"""
+
+    def __init__(self, broker_host, broker_port=1883, username=None, password=None,
+                 use_tls=False, shared_key='', on_message=None, on_status=None, client_id=None):
+        self.broker_host = broker_host
+        self.broker_port = int(broker_port or 1883)
+        self.username = username or None
+        self.password = password or None
+        self.use_tls = use_tls
+        self.shared_key = shared_key or 'noset'
+        self.client_id = client_id
+        self.on_message = on_message
+        self.on_status = on_status
+        self.key, _ = derive_key_and_room(self.shared_key)
+        self.topic = derive_mqtt_topic(self.shared_key)
+        self.client = None
+        self.running = False
+        self._chunks = {}
+
+    def _status(self, state, text):
+        if self.on_status:
+            try:
+                self.on_status(state, text)
+            except Exception:
+                pass
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code == 0:
+            client.subscribe(self.topic, qos=1)
+            self._status('connected', '已连接 MQTT')
+        else:
+            self._status('error', f'MQTT 连接失败: {reason_code}')
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        if self.running:
+            self._status('disconnected', 'MQTT 已断开，重连中...')
+
+    def _emit(self, text, enter=False):
+        if self.on_message:
+            try:
+                self.on_message(text, enter)
+            except Exception as e:
+                print(f"MQTT 消息处理错误: {e}")
+
+    def _cleanup_chunks(self):
+        now = time.time()
+        expired = [cid for cid, item in self._chunks.items() if now - item['ts'] > MQTT_CHUNK_TIMEOUT]
+        for cid in expired:
+            del self._chunks[cid]
+
+    def _handle_payload(self, raw):
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return
+        try:
+            msg_type = payload.get('t')
+            if msg_type == 'text':
+                text = decrypt_message(self.key, payload['iv'], payload['data'])
+                self._emit(text, bool(payload.get('e')))
+            elif msg_type == 'chunk':
+                chunk_id = str(payload.get('id'))
+                index = int(payload.get('i', -1))
+                total = int(payload.get('n', 0))
+                if not chunk_id or index < 0 or total <= 0:
+                    return
+                part = decrypt_bytes(self.key, payload['iv'], payload['data'])
+                item = self._chunks.setdefault(chunk_id, {'n': total, 'parts': {}, 'ts': time.time()})
+                item['parts'][index] = part
+                item['e'] = bool(payload.get('e'))
+                if len(item['parts']) == item['n']:
+                    ordered = b''.join(item['parts'][i] for i in sorted(item['parts']))
+                    del self._chunks[chunk_id]
+                    self._emit(ordered.decode('utf-8'), bool(item.get('e')))
+                self._cleanup_chunks()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"MQTT payload 处理异常: {e}")
+
+    def _on_message(self, client, userdata, msg):
+        self._handle_payload(msg.payload)
+
+    def start(self):
+        if not MQTT_AVAILABLE:
+            self._status('error', 'MQTT 模式需要依赖: pip install paho-mqtt cryptography')
+            return False
+        if self.running:
+            return True
+        self.running = True
+        try:
+            self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.client_id or 'qaa-airtype-pc')
+            if self.username:
+                self.client.username_pw_set(self.username, self.password)
+            if self.use_tls:
+                self.client.tls_set()
+            self.client.on_connect = self._on_connect
+            self.client.on_disconnect = self._on_disconnect
+            self.client.on_message = self._on_message
+            self.client.connect_async(self.broker_host, self.broker_port, keepalive=30)
+            self.client.loop_start()
+            self._status('connecting', '正在连接 MQTT Broker...')
+            return True
+        except Exception as e:
+            self.running = False
+            self._status('error', f'MQTT 启动失败: {e}')
+            return False
+
+    def stop(self):
+        self.running = False
+        if self.client:
+            try:
+                self.client.disconnect()
+                self.client.loop_stop()
+            except Exception:
+                pass
+            self.client = None
+
+
 @app.route('/')
 def index():
     theme = request.args.get('theme')
@@ -446,6 +649,7 @@ class ServerApp:
         self.root.title("QAA AirType")
         # 增加高度以容纳二维码
         self.root.geometry("512x640")
+        self.root.geometry("512x760")
         self.root.resizable(True, True)
         self.root.minsize(380, 480)  # 最小尺寸
 
@@ -470,12 +674,15 @@ class ServerApp:
         x = (screen_width - 512) // 2
         y = (screen_height - 640) // 2
         self.root.geometry(f"512x640+{x}+{y}")
+        self.root.geometry(f"512x760+{x}+{y}")
 
         self.all_ips = get_all_ips()
         self.ip_var = tk.StringVar(value=self.all_ips[0])
         self.is_running = False
         self.cf_client = None  # CF 模式客户端
         self.cf_mode = False   # 是否为 CF 模式
+        self.mqtt_client = None  # MQTT 模式客户端
+        self.mqtt_mode = False   # 是否为 MQTT 模式
 
         # 加载配置
         self.config = load_config()
@@ -484,9 +691,17 @@ class ServerApp:
         saved_ip = self.config.get('ip', '')
         saved_cf_url = self.config.get('cf_url', '')
         saved_cf_key = self.config.get('cf_key', '')
+        saved_mqtt_host = self.config.get('mqtt_host', 'broker.emqx.io')
+        saved_mqtt_port = self.config.get('mqtt_port', '1883')
+        saved_mqtt_user = self.config.get('mqtt_user', '')
+        saved_mqtt_pass = self.config.get('mqtt_pass', '')
+        saved_mqtt_key = self.config.get('mqtt_key', '')
+        saved_mqtt_page = self.config.get('mqtt_page_url', '')
+        saved_mqtt_tls = self.config.get('mqtt_tls', False)
 
-        # 在 IP 列表末尾添加 CF 模式选项
         self.all_ips.append('Cloudflare Chat Workers')
+        self.all_ips.append('MQTT 中转')
+        # 在 IP 列表末尾添加 MQTT / CF 模式选项
 
         # 主容器
         main_frame = tk.Frame(root, padx=20, pady=20)
@@ -534,8 +749,45 @@ class ServerApp:
         self.cf_key_entry = tk.Entry(self.cf_frame, textvariable=self.cf_key_var, font=("Arial", 10), show="*")
         self.cf_key_entry.pack(fill='x')
 
+        # --- MQTT 模式控件 ---
+        self.mqtt_frame = tk.Frame(main_frame)
+
+        def mqtt_row(label_text, var, show=None):
+            row = tk.Frame(self.mqtt_frame)
+            row.pack(fill='x', pady=(0, 5))
+            tk.Label(row, text=label_text, font=("Arial", 10, "bold"), width=10, anchor='w').pack(side='left')
+            entry = tk.Entry(row, textvariable=var, font=("Arial", 10), show=show)
+            entry.pack(side='left', fill='x', expand=True)
+            return entry
+
+        self.mqtt_host_var = tk.StringVar(value=saved_mqtt_host)
+        self.mqtt_host_entry = mqtt_row("Broker 地址:", self.mqtt_host_var)
+
+        port_tls_row = tk.Frame(self.mqtt_frame)
+        port_tls_row.pack(fill='x', pady=(0, 5))
+        tk.Label(port_tls_row, text="端口:", font=("Arial", 10, "bold"), width=10, anchor='w').pack(side='left')
+        self.mqtt_port_var = tk.StringVar(value=saved_mqtt_port)
+        self.mqtt_port_entry = tk.Entry(port_tls_row, textvariable=self.mqtt_port_var, font=("Arial", 10), width=8)
+        self.mqtt_port_entry.pack(side='left')
+        self.mqtt_tls_var = tk.BooleanVar(value=bool(saved_mqtt_tls))
+        tk.Checkbutton(port_tls_row, text="TLS", variable=self.mqtt_tls_var, font=("Arial", 9)).pack(side='left', padx=(8, 0))
+
+        self.mqtt_user_var = tk.StringVar(value=saved_mqtt_user)
+        self.mqtt_user_entry = mqtt_row("用户名:", self.mqtt_user_var)
+        self.mqtt_pass_var = tk.StringVar(value=saved_mqtt_pass)
+        self.mqtt_pass_entry = mqtt_row("密码:", self.mqtt_pass_var, show="*")
+        self.mqtt_key_var = tk.StringVar(value=saved_mqtt_key)
+        self.mqtt_key_entry = mqtt_row("共享密钥:", self.mqtt_key_var, show="*")
+        self.mqtt_page_var = tk.StringVar(value=saved_mqtt_page)
+        self.mqtt_page_entry = mqtt_row("手机页面:", self.mqtt_page_var)
+        tk.Label(self.mqtt_frame, text="手机页面地址用于二维码，留空则用本机地址", font=("Arial", 8), fg="#888").pack(anchor='w')
+
         # 恢复保存的模式
-        if saved_mode == 'cf':
+        if saved_mode == 'mqtt':
+            self.ip_var.set('MQTT 中转')
+            self.lan_frame.pack_forget()
+            self.mqtt_frame.pack(fill='x', pady=(0, 10))
+        elif saved_mode == 'cf':
             self.ip_var.set('Cloudflare Chat Workers')
             self.lan_frame.pack_forget()
             self.cf_frame.pack(fill='x', pady=(0, 10))
@@ -543,6 +795,17 @@ class ServerApp:
             self.ip_var.set(saved_ip)
 
         # 按钮组
+        # 自启动与自动连接选项
+        self.options_frame = tk.Frame(main_frame)
+        self.options_frame.pack(fill='x', pady=(0, 10))
+        self.autostart_var = tk.BooleanVar(value=bool(self.config.get('autostart', False)))
+        self.auto_connect_var = tk.BooleanVar(value=bool(self.config.get('auto_connect', True)))
+        self.autostart_check = tk.Checkbutton(self.options_frame, text="开机自启动", variable=self.autostart_var,
+                                              command=self.on_autostart_toggle, font=("Arial", 9))
+        self.autostart_check.pack(side='left')
+        self.auto_connect_check = tk.Checkbutton(self.options_frame, text="启动后自动连接", variable=self.auto_connect_var,
+                                               command=self.on_auto_connect_toggle, font=("Arial", 9))
+        self.auto_connect_check.pack(side='left', padx=(10, 0))
         self.button_frame = tk.Frame(main_frame)
         self.button_frame.pack(fill='x', pady=(0, 20))
 
@@ -557,6 +820,14 @@ class ServerApp:
                                       bg="#8e8e93", fg="white", font=("Arial", 12, "bold"),
                                       relief="flat", pady=8, cursor="hand2", width=3)
         self.btn_minimize.pack(side='right')
+
+        # 停止按钮：只停止服务，不退出程序
+        self.btn_stop = tk.Button(self.button_frame, text="停止", command=self.stop_service,
+                                 bg="#ff9500", fg="white", font=("Arial", 12, "bold"),
+                                 relief="flat", pady=8, cursor="hand2", width=5)
+        self.btn_stop.pack(side='right', padx=(5, 0))
+
+        # 退出按钮：停止服务后仍可继续修改配置，需要彻底退出时使用
 
         # 二维码显示区域
         self.qr_label = tk.Label(main_frame, text="",
@@ -575,10 +846,15 @@ class ServerApp:
         self.tip_label = tk.Label(main_frame, text="", fg="#888", font=("Arial", 8))
         self.tip_label.pack(pady=(5, 0))
 
+        # 启动时同步一次自启动注册表，并在需要时自动连接上次配置
+        self.apply_autostart()
+        if self.auto_connect_var.get():
+            self.root.after(500, self.auto_connect_last)
+
     def show_all_ips_display(self, port, started=False):
         """显示所有可用 IP 地址列表"""
         # 过滤掉 0.0.0.0 和 Cloudflare 选项
-        all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare')]
+        all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare') and not ip.startswith('MQTT')]
         ip_list = '\n'.join([f"http://{ip}:{port}" for ip in all_ips])
 
         if started:
@@ -619,6 +895,100 @@ class ServerApp:
         img_tk = ImageTk.PhotoImage(img)
         return img_tk
 
+    def _autostart_command(self):
+        """构造开机自启动命令行，后台最小化启动"""
+        if getattr(sys, 'frozen', False):
+            return f'"{sys.executable}" --minimized'
+        pythonw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+        if not os.path.exists(pythonw):
+            pythonw = sys.executable
+        script = os.path.abspath(__file__)
+        return f'"{pythonw}" "{script}" --minimized'
+
+    def set_autostart(self, enabled):
+        """写入或删除 Windows 开机自启动注册表项"""
+        if not IS_WINDOWS:
+            return
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r'Software\Microsoft\Windows\CurrentVersion\Run',
+                                 0, winreg.KEY_SET_VALUE)
+            if enabled:
+                winreg.SetValueEx(key, 'QAA-AirType', 0, winreg.REG_SZ, self._autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, 'QAA-AirType')
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception as e:
+            print(f"自启动设置失败: {e}")
+
+    def apply_autostart(self):
+        """启动时同步一次自启动状态"""
+        self.set_autostart(bool(self.autostart_var.get()))
+
+    def on_autostart_toggle(self):
+        self.config['autostart'] = bool(self.autostart_var.get())
+        save_config(self.config)
+        self.set_autostart(self.config['autostart'])
+
+    def on_auto_connect_toggle(self):
+        self.config['auto_connect'] = bool(self.auto_connect_var.get())
+        save_config(self.config)
+
+    def auto_connect_last(self):
+        """启动后自动连接上一次使用的模式"""
+        mode = self.config.get('mode', 'lan')
+        if mode == 'mqtt':
+            if MQTT_AVAILABLE and self.mqtt_host_var.get().strip() and self.mqtt_key_var.get():
+                self.start_mqtt_mode()
+            else:
+                self.tip_label.config(text="上次为 MQTT 模式，配置不完整，未自动连接", fg="#888")
+        elif mode == 'cf':
+            if CF_AVAILABLE and self.cf_url_var.get().strip():
+                self.start_cf_mode()
+            else:
+                self.tip_label.config(text="上次为 CF 模式，配置不完整，未自动连接", fg="#888")
+        elif mode == 'lan':
+            if self.port_var.get().strip().isdigit():
+                self.start_lan_mode()
+            else:
+                self.tip_label.config(text="上次为局域网模式，端口无效，未自动连接", fg="#888")
+
+    def stop_service(self):
+        """停止当前服务，但不退出程序"""
+        if self.mqtt_client:
+            self.mqtt_client.stop()
+            self.mqtt_client = None
+        if self.cf_client:
+            self.cf_client.stop()
+            self.cf_client = None
+        if not self.cf_mode and not self.mqtt_mode:
+            # 局域网 Flask 服务通过本机 shutdown 接口停止
+            try:
+                import urllib.request
+                port = self.port_var.get().strip() or '5000'
+                urllib.request.urlopen(f'http://127.0.0.1:{port}/__shutdown__', data=b'', timeout=2)
+            except Exception:
+                pass
+        self.is_running = False
+        self.cf_mode = False
+        self.mqtt_mode = False
+        self.btn_start.config(text="启动服务", bg="#007AFF", state='normal')
+        self.port_entry.config(state='normal', bg='white')
+        self.ip_combo.config(state='readonly')
+        for entry in (self.mqtt_host_entry, self.mqtt_port_entry, self.mqtt_user_entry,
+                      self.mqtt_pass_entry, self.mqtt_key_entry, self.mqtt_page_entry):
+            entry.config(state='normal', bg='white')
+        self.cf_url_entry.config(state='normal', bg='white')
+        self.cf_key_entry.config(state='normal', bg='white')
+        self.show_all_ips_display(5000)
+        self.url_label.config(text="")
+        self.current_url = None
+        self.tip_label.config(text="服务已停止，可修改配置后重新启动", fg="#888")
+
     def toggle_server(self):
         if self.is_running:
             # 停止服务并退出
@@ -628,7 +998,19 @@ class ServerApp:
         selected = self.ip_var.get()
 
         # 判断模式并启动
-        if selected == 'Cloudflare Chat Workers':
+        if selected == 'MQTT 中转':
+            # 保存 MQTT 配置
+            self.config['mode'] = 'mqtt'
+            self.config['mqtt_host'] = self.mqtt_host_var.get().strip()
+            self.config['mqtt_port'] = self.mqtt_port_var.get().strip()
+            self.config['mqtt_user'] = self.mqtt_user_var.get().strip()
+            self.config['mqtt_pass'] = self.mqtt_pass_var.get()
+            self.config['mqtt_key'] = self.mqtt_key_var.get()
+            self.config['mqtt_page_url'] = self.mqtt_page_var.get().strip()
+            self.config['mqtt_tls'] = bool(self.mqtt_tls_var.get())
+            save_config(self.config)
+            self.start_mqtt_mode()
+        elif selected == 'Cloudflare Chat Workers':
             # 保存 CF 配置
             self.config['mode'] = 'cf'
             self.config['cf_url'] = self.cf_url_var.get()
@@ -701,6 +1083,92 @@ class ServerApp:
         self.current_url = url
         self.tip_label.config(text="CF 模式：手机访问上方链接发送消息")
 
+    def start_mqtt_mode(self):
+        """启动 MQTT 模式"""
+        if not MQTT_AVAILABLE:
+            messagebox.showerror("错误", "MQTT 模式需要安装依赖:\npip install paho-mqtt cryptography")
+            return
+
+        host = self.mqtt_host_var.get().strip()
+        port = self.mqtt_port_var.get().strip() or '1883'
+        key = self.mqtt_key_var.get()
+        username = self.mqtt_user_var.get().strip()
+        password = self.mqtt_pass_var.get()
+
+        if not host:
+            messagebox.showerror("错误", "请输入 MQTT Broker 地址")
+            return
+        if not key:
+            messagebox.showerror("错误", "请输入共享密钥")
+            return
+
+        self.mqtt_mode = True
+        self.mqtt_client = MqttClient(
+            broker_host=host,
+            broker_port=port,
+            username=username or None,
+            password=password or None,
+            use_tls=bool(self.mqtt_tls_var.get()),
+            shared_key=key,
+            on_message=self.on_mqtt_message,
+            on_status=self.on_mqtt_status
+        )
+        if not self.mqtt_client.start():
+            self.mqtt_mode = False
+            return
+
+        self.is_running = True
+        self.btn_start.config(text="停止服务并退出", bg="#ff3b30")
+        self.ip_combo.config(state='disabled')
+        for entry in (self.mqtt_host_entry, self.mqtt_port_entry, self.mqtt_user_entry,
+                      self.mqtt_pass_entry, self.mqtt_key_entry, self.mqtt_page_entry):
+            entry.config(state='disabled', bg="#f0f0f0")
+
+        from urllib.parse import quote
+        tls_flag = 1 if self.mqtt_tls_var.get() else 0
+        params = (f"theme=mqtt&k={quote(key)}&h={quote(host)}&p={quote(port)}"
+                  f"&u={quote(username)}&w={quote(password)}&tls={tls_flag}")
+        page_url = self.mqtt_page_var.get().strip()
+        if not page_url:
+            page_url = f"http://{get_host_ip()}:{self.port_var.get() or 5000}/"
+        sep = '&' if '?' in page_url else '?'
+        full_url = f"{page_url}{sep}{params}"
+        try:
+            qr_size = min(self.root.winfo_width() - 80, 250)
+            self.qr_img = self.generate_qr(full_url, target_size=qr_size)
+            self.qr_label.config(image=self.qr_img, width=qr_size, height=qr_size,
+                                bg="white", text='', font=("Arial", 10))
+        except Exception as e:
+            self.qr_label.config(text=f"二维码生成失败\n{e}")
+
+        self.url_label.config(text=full_url)
+        self.current_url = full_url
+        self.tip_label.config(text="MQTT 模式：手机打开页面后在任意网络使用")
+
+    def on_mqtt_message(self, text, enter=False):
+        """MQTT 模式收到消息回调"""
+        self.root.after(0, lambda: self._handle_mqtt_message(text, enter))
+
+    def _handle_mqtt_message(self, text, enter=False):
+        paste_text(text)
+        if enter:
+            send_enter_windows()
+        display = text[:30] + '...' if len(text) > 30 else text
+        self.tip_label.config(text=f"已粘贴: {display}", fg="#34c759")
+
+    def on_mqtt_status(self, state, text):
+        """MQTT 状态回调"""
+        self.root.after(0, lambda: self._update_mqtt_status(state, text))
+
+    def _update_mqtt_status(self, state, text):
+        colors = {
+            'connected': '#34c759',
+            'connecting': '#f59e0b',
+            'disconnected': '#888',
+            'error': '#ff3b30'
+        }
+        self.tip_label.config(text=text, fg=colors.get(state, '#888'))
+
     def start_lan_mode(self):
         """启动局域网模式"""
         port_str = self.port_var.get().strip()
@@ -733,7 +1201,7 @@ class ServerApp:
 
         if host_ip.startswith('0.0.0.0'):
             self.show_all_ips_display(port, started=True)
-            all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare')]
+            all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare') and not ip.startswith('MQTT')]
             theme = self.theme_var.get().strip()
             theme_param = f"?theme={theme}" if theme else ""
             self.url_label.config(text="请手动输入上方地址")
@@ -784,13 +1252,20 @@ class ServerApp:
         """模式/IP 改变时切换界面"""
         selected = self.ip_var.get()
 
-        if selected == 'Cloudflare Chat Workers':
+        if selected == 'MQTT 中转':
+            # 切换到 MQTT 模式界面
+            self.lan_frame.pack_forget()
+            self.cf_frame.pack_forget()
+            self.mqtt_frame.pack(fill='x', pady=(0, 10), before=self.button_frame)
+        elif selected == 'Cloudflare Chat Workers':
             # 切换到 CF 模式界面
             self.lan_frame.pack_forget()
+            self.mqtt_frame.pack_forget()
             self.cf_frame.pack(fill='x', pady=(0, 10), before=self.button_frame)
         else:
             # 切换到局域网模式界面
             self.cf_frame.pack_forget()
+            self.mqtt_frame.pack_forget()
             self.lan_frame.pack(fill='x', pady=(0, 10), before=self.button_frame)
 
             # 如果运行中且是 0.0.0.0 模式，更新二维码
@@ -804,7 +1279,7 @@ class ServerApp:
 
         if host_ip.startswith('0.0.0.0'):
             self.show_all_ips_display(port, started=True)
-            all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare')]
+            all_ips = [ip for ip in self.all_ips if not ip.startswith('0.0.0.0') and not ip.startswith('Cloudflare') and not ip.startswith('MQTT')]
             theme = self.theme_var.get().strip()
             theme_param = f"?theme={theme}" if theme else ""
             self.url_label.config(text="请手动输入上方地址")
@@ -870,6 +1345,10 @@ class ServerApp:
         if self.cf_client:
             self.cf_client.stop()
             self.cf_client = None
+        # 停止 MQTT 客户端
+        if self.mqtt_client:
+            self.mqtt_client.stop()
+            self.mqtt_client = None
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.quit()
@@ -882,4 +1361,6 @@ class ServerApp:
 if __name__ == '__main__':
     root = tk.Tk()
     app_gui = ServerApp(root)
+    if '--minimized' in sys.argv:
+        app_gui.hide_window()
     root.mainloop()

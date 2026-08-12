@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>无线键盘</title>
+    <link rel="stylesheet" href="./static/mqtt.css">
+</head>
+<body>
+    <header>
+        <h2>无线键盘</h2>
+        <div class="header-right">
+            <div class="status-wrap"><span id="statusDot" class="dot"></span><span id="statusText">未连接</span></div>
+            <button id="settingsBtn" class="icon-btn">设置</button>
+        </div>
+    </header>
+
+    <main id="chatArea">
+        <div class="empty-tip" id="emptyTip">还没有发送记录<br>轻触屏幕任意位置即可输入</div>
+        <ul id="historyList" class="history-list"></ul>
+    </main>
+
+    <div id="inputPanel">
+        <div class="input-row">
+            <input id="textInput" type="text" placeholder="点击输入，或使用语音输入" autocomplete="off" enterkeyhint="send">
+            <button id="sendBtn" aria-label="发送">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"></path><path d="M22 2l-7 20-4-9-9-4 20-7z"></path></svg>
+            </button>
+        </div>
+    </div>
+
+    <div id="overlay">
+        <div class="sheet">
+            <h3>连接设置</h3>
+            <div class="field">
+                <label>MQTT 服务器</label>
+                <input id="brokerInput" type="text" placeholder="broker.emqx.io 或 wss://host:port/mqtt" autocomplete="off">
+            </div>
+            <div class="row">
+                <div class="field">
+                    <label>端口</label>
+                    <input id="portInput" type="number" placeholder="8084">
+                </div>
+                <div class="field">
+                    <label>共享密钥</label>
+                    <input id="keyInput" type="text" placeholder="与电脑端一致" autocomplete="off">
+                </div>
+            </div>
+            <div class="row">
+                <div class="field">
+                    <label>用户名</label>
+                    <input id="userInput" type="text" autocomplete="off">
+                </div>
+                <div class="field">
+                    <label>密码</label>
+                    <input id="passInput" type="password">
+                </div>
+            </div>
+            <div class="switch-row">
+                <input id="tlsInput" type="checkbox">
+                <label for="tlsInput">使用 TLS（wss）</label>
+            </div>
+            <div class="switch-row">
+                <input id="enterInput" type="checkbox">
+                <label for="enterInput">发送后自动回车</label>
+            </div>
+            <button id="saveSettingsBtn" class="btn primary">保存并连接</button>
+            <button id="closeSettingsBtn" class="btn secondary">取消</button>
+            <button id="clearHistoryBtn" class="btn secondary">清空聊天记录</button>
+            <div class="hint">默认使用公共 MQTT 服务器，也可以填入你自己的服务器地址。配置只保存在本机浏览器。</div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+    <script>
+        if (typeof mqtt === 'undefined') {
+            var s1 = document.createElement('script');
+            s1.src = 'https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js';
+            document.head.appendChild(s1);
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/node-forge@1.3.1/dist/forge.min.js"></script>
+    <script>
+        if (typeof forge === 'undefined') {
+            var s2 = document.createElement('script');
+            s2.src = 'https://unpkg.com/node-forge@1.3.1/dist/forge.min.js';
+            document.head.appendChild(s2);
+        }
+    </script>
+    <script src="./static/mqtt.js"></script>
+</body>
+</html>
