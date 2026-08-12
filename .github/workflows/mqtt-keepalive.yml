@@ -1,0 +1,27 @@
+name: MQTT Keepalive
+
+on:
+  schedule:
+    - cron: '0 3 1,11,21 * *'
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install paho-mqtt
+        run: pip install paho-mqtt
+      - name: Run keepalive
+        env:
+          MQTT_BROKER: ${{ secrets.MQTT_BROKER }}
+          MQTT_PORT: ${{ secrets.MQTT_PORT }}
+          MQTT_TLS: ${{ secrets.MQTT_TLS }}
+          MQTT_USERNAME: ${{ secrets.MQTT_USERNAME }}
+          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
+          MQTT_TOPIC: ${{ secrets.MQTT_TOPIC }}
+          MQTT_PAYLOAD: ${{ secrets.MQTT_PAYLOAD }}
+        run: python scripts/mqtt_keepalive.py
